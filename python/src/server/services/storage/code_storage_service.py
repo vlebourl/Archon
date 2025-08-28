@@ -18,23 +18,8 @@ from supabase import Client
 from ...config.logfire_config import search_logger
 from ..embeddings.contextual_embedding_service import generate_contextual_embeddings_batch
 from ..embeddings.embedding_service import create_embeddings_batch
+from ..llm_utils import create_llm_completion, parse_llm_json_response
 
-
-def _get_model_choice() -> str:
-    """Get MODEL_CHOICE with direct fallback."""
-    try:
-        # Direct cache/env fallback
-        from ..credential_service import credential_service
-
-        if credential_service._cache_initialized and "MODEL_CHOICE" in credential_service._cache:
-            model = credential_service._cache["MODEL_CHOICE"]
-        else:
-            model = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
-        search_logger.debug(f"Using model choice: {model}")
-        return model
-    except Exception as e:
-        search_logger.warning(f"Error getting model choice: {e}, using default")
-        return "gpt-4.1-nano"
 
 
 def _get_max_workers() -> int:
@@ -505,9 +490,6 @@ def generate_code_example_summary(
     Returns:
         A dictionary with 'summary' and 'example_name'
     """
-    # Get model choice from credential service (RAG setting)
-    model_choice = _get_model_choice()
-
     # Create the prompt
     prompt = f"""<context_before>
 {context_before[-500:] if len(context_before) > 500 else context_before}
@@ -535,67 +517,31 @@ Format your response as JSON:
 """
 
     try:
-        # Get LLM client using fallback
-        try:
-            import os
-
-            import openai
-
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                # Try to get from credential service with direct fallback
-                from ..credential_service import credential_service
-
-                if (
-                    credential_service._cache_initialized
-                    and "OPENAI_API_KEY" in credential_service._cache
-                ):
-                    cached_key = credential_service._cache["OPENAI_API_KEY"]
-                    if isinstance(cached_key, dict) and cached_key.get("is_encrypted"):
-                        api_key = credential_service._decrypt_value(cached_key["encrypted_value"])
-                    else:
-                        api_key = cached_key
-                else:
-                    api_key = os.getenv("OPENAI_API_KEY", "")
-
-            if not api_key:
-                raise ValueError("No OpenAI API key available")
-
-            client = openai.OpenAI(api_key=api_key)
-        except Exception as e:
-            search_logger.error(
-                f"Failed to create LLM client fallback: {e} - returning default values"
-            )
-            return {
-                "example_name": f"Code Example{f' ({language})' if language else ''}",
-                "summary": "Code example for demonstration purposes.",
-            }
-
-        search_logger.debug(
-            f"Calling OpenAI API with model: {model_choice}, language: {language}, code length: {len(code)}"
+        # Log the code analysis request
+        search_logger.info(
+            f"🔍 [CODE ANALYSIS] Starting analysis - Language: {language}, "
+            f"Code length: {len(code)} chars, Context: {len(context_before + context_after)} chars"
         )
-
-        response = client.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that analyzes code examples and provides JSON responses with example names and summaries.",
-                },
-                {"role": "user", "content": prompt},
-            ],
+        
+        # Use centralized LLM completion
+        response_content = create_llm_completion(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that analyzes code examples and provides JSON responses with example names and summaries.",
+            provider=provider,
             response_format={"type": "json_object"},
+            temperature=0.7,
         )
-
-        response_content = response.choices[0].message.content.strip()
-        search_logger.debug(f"OpenAI API response: {repr(response_content[:200])}...")
-
-        result = json.loads(response_content)
-
-        # Validate the response has the required fields
-        if not result.get("example_name") or not result.get("summary"):
-            search_logger.warning(f"Incomplete response from OpenAI: {result}")
-
+        
+        search_logger.debug(f"LLM response preview: {repr(response_content[:200])}...")
+        
+        # Parse JSON with robust handling for different provider formats
+        result = parse_llm_json_response(
+            response_content,
+            expected_fields=["example_name", "summary"],
+            provider_name=provider or "default"
+        )
+        
+        # Build final result with fallbacks
         final_result = {
             "example_name": result.get(
                 "example_name", f"Code Example{f' ({language})' if language else ''}"
@@ -604,20 +550,20 @@ Format your response as JSON:
         }
 
         search_logger.info(
-            f"Generated code example summary - Name: '{final_result['example_name']}', Summary length: {len(final_result['summary'])}"
+            f"Generated code example summary - Name: '{final_result['example_name']}', Summary length: {len(final_result['summary'])}, Full summary: {final_result['summary']}"
         )
         return final_result
 
     except json.JSONDecodeError as e:
         search_logger.error(
-            f"Failed to parse JSON response from OpenAI: {e}, Response: {repr(response_content) if 'response_content' in locals() else 'No response'}"
+            f"Failed to parse JSON response: {e}, Response: {repr(response_content) if 'response_content' in locals() else 'No response'}"
         )
         return {
             "example_name": f"Code Example{f' ({language})' if language else ''}",
             "summary": "Code example for demonstration purposes.",
         }
     except Exception as e:
-        search_logger.error(f"Error generating code example summary: {e}, Model: {model_choice}")
+        search_logger.error(f"Error generating code example summary: {e}")
         return {
             "example_name": f"Code Example{f' ({language})' if language else ''}",
             "summary": "Code example for demonstration purposes.",
@@ -802,7 +748,7 @@ async def add_code_examples_to_supabase(
             os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false").lower() == "true"
         )
 
-    search_logger.info(
+    search_logger.debug(
         f"Using contextual embeddings for code examples: {use_contextual_embeddings}"
     )
 

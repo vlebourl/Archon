@@ -11,25 +11,11 @@ from supabase import Client
 
 from ..config.logfire_config import get_logger, search_logger
 from .client_manager import get_supabase_client
+from .llm_utils import create_llm_completion, parse_llm_json_response
 
 logger = get_logger(__name__)
 
 
-def _get_model_choice() -> str:
-    """Get MODEL_CHOICE with direct fallback."""
-    try:
-        # Direct cache/env fallback
-        from .credential_service import credential_service
-
-        if credential_service._cache_initialized and "MODEL_CHOICE" in credential_service._cache:
-            model = credential_service._cache["MODEL_CHOICE"]
-        else:
-            model = os.getenv("MODEL_CHOICE", "gpt-4.1-nano")
-        logger.debug(f"Using model choice: {model}")
-        return model
-    except Exception as e:
-        logger.warning(f"Error getting model choice: {e}, using default")
-        return "gpt-4.1-nano"
 
 
 def extract_source_summary(
@@ -55,10 +41,6 @@ def extract_source_summary(
     if not content or len(content.strip()) == 0:
         return default_summary
 
-    # Get the model choice from credential service (RAG setting)
-    model_choice = _get_model_choice()
-    search_logger.info(f"Generating summary for {source_id} using model: {model_choice}")
-
     # Limit content length to avoid token limits
     truncated_content = content[:25000] if len(content) > 25000 else content
 
@@ -71,65 +53,23 @@ The above content is from the documentation for '{source_id}'. Please provide a 
 """
 
     try:
-        try:
-            import os
-
-            import openai
-
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                # Try to get from credential service with direct fallback
-                from .credential_service import credential_service
-
-                if (
-                    credential_service._cache_initialized
-                    and "OPENAI_API_KEY" in credential_service._cache
-                ):
-                    cached_key = credential_service._cache["OPENAI_API_KEY"]
-                    if isinstance(cached_key, dict) and cached_key.get("is_encrypted"):
-                        api_key = credential_service._decrypt_value(cached_key["encrypted_value"])
-                    else:
-                        api_key = cached_key
-                else:
-                    api_key = os.getenv("OPENAI_API_KEY", "")
-
-            if not api_key:
-                raise ValueError("No OpenAI API key available")
-
-            client = openai.OpenAI(api_key=api_key)
-            search_logger.info("Successfully created LLM client fallback for summary generation")
-        except Exception as e:
-            search_logger.error(f"Failed to create LLM client fallback: {e}")
-            return default_summary
-
-        # Call the OpenAI API to generate the summary
-        response = client.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that provides concise library/tool/framework summaries.",
-                },
-                {"role": "user", "content": prompt},
-            ],
+        search_logger.info(
+            f"📄 [SOURCE SUMMARY] Starting summary generation for {source_id} - "
+            f"Content length: {len(truncated_content)} chars, Max length: {max_length}"
         )
-
-        # Extract the generated summary with proper error handling
-        if not response or not response.choices or len(response.choices) == 0:
-            search_logger.error(f"Empty or invalid response from LLM for {source_id}")
-            return default_summary
-
-        message_content = response.choices[0].message.content
-        if message_content is None:
-            search_logger.error(f"LLM returned None content for {source_id}")
-            return default_summary
-
-        summary = message_content.strip()
+        
+        summary = create_llm_completion(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant that provides concise library/tool/framework summaries.",
+            provider=provider,
+            temperature=0.7,
+        )
 
         # Ensure the summary is not too long
         if len(summary) > max_length:
             summary = summary[:max_length] + "..."
 
+        search_logger.info(f"Generated summary for {source_id}, length: {len(summary)}")
         return summary
 
     except Exception as e:
@@ -164,45 +104,13 @@ def generate_source_title_and_metadata(
     # Try to generate a better title from content
     if content and len(content.strip()) > 100:
         try:
-            try:
-                import os
-
-                import openai
-
-                api_key = os.getenv("OPENAI_API_KEY")
-                if not api_key:
-                    # Try to get from credential service with direct fallback
-                    from .credential_service import credential_service
-
-                    if (
-                        credential_service._cache_initialized
-                        and "OPENAI_API_KEY" in credential_service._cache
-                    ):
-                        cached_key = credential_service._cache["OPENAI_API_KEY"]
-                        if isinstance(cached_key, dict) and cached_key.get("is_encrypted"):
-                            api_key = credential_service._decrypt_value(
-                                cached_key["encrypted_value"]
-                            )
-                        else:
-                            api_key = cached_key
-                    else:
-                        api_key = os.getenv("OPENAI_API_KEY", "")
-
-                if not api_key:
-                    raise ValueError("No OpenAI API key available")
-
-                client = openai.OpenAI(api_key=api_key)
-            except Exception as e:
-                search_logger.error(
-                    f"Failed to create LLM client fallback for title generation: {e}"
-                )
-                # Don't proceed if client creation fails
-                raise
-
-            model_choice = _get_model_choice()
-
             # Limit content for prompt
             sample_content = content[:3000] if len(content) > 3000 else content
+            
+            search_logger.info(
+                f"🏷️ [TITLE GENERATION] Starting title generation for {source_id} - "
+                f"Sample content length: {len(sample_content)} chars"
+            )
 
             prompt = f"""Based on this content from {source_id}, generate a concise, descriptive title (3-6 words) that captures what this source is about:
 
@@ -210,22 +118,18 @@ def generate_source_title_and_metadata(
 
 Provide only the title, nothing else."""
 
-            response = client.chat.completions.create(
-                model=model_choice,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that generates concise titles.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
+            generated_title = create_llm_completion(
+                prompt=prompt,
+                system_prompt="You are a helpful assistant that generates concise titles.",
+                provider=provider,
+                temperature=0.7,
             )
-
-            generated_title = response.choices[0].message.content.strip()
+            
             # Clean up the title
             generated_title = generated_title.strip("\"'")
             if len(generated_title) < 50:  # Sanity check
                 title = generated_title
+                search_logger.info(f"Generated title for {source_id}: {title}")
 
         except Exception as e:
             search_logger.error(f"Error generating title for {source_id}: {e}")
